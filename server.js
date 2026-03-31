@@ -79,24 +79,21 @@ function messagesToPrompt(messages) {
 // When useTools=true, enables native Claude Code tool execution
 // (--dangerously-skip-permissions --max-turns 10 --output-format json)
 // ---------------------------------------------------------------------------
-const MAX_TOOL_TURNS = parseInt(process.env.MAX_TOOL_TURNS || '10', 10);
+const DEFAULT_MAX_TOOL_TURNS = parseInt(process.env.MAX_TOOL_TURNS || '10', 10);
 
-function callClaude(prompt, systemPrompt, useTools = false) {
+function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_MAX_TOOL_TURNS) {
   return new Promise((resolve, reject) => {
-    const args = ['--print'];
+    // Always use --verbose --output-format stream-json to parse assistant
+    // messages directly, because CLI v2.1.83 has a bug where --print returns
+    // empty "result" even when the model actually responded.
+    const args = ['--print', '--verbose', '--output-format', 'stream-json'];
 
     if (useTools) {
-      // Let Claude Code handle tools natively (Read, Write, Bash, etc.)
-      // on the EC2 server. This is safe because the EC2 is a clean machine
-      // with no personal data.
       args.push('--dangerously-skip-permissions');
-      args.push('--max-turns', String(MAX_TOOL_TURNS));
-      args.push('--output-format', 'json');
+      args.push('--max-turns', String(maxTurns));
     }
 
-    // Use --system-prompt flag if it fits within safe CLI arg size.
-    // Conversation goes through stdin to prevent E2BIG errors.
-    const SYS_PROMPT_ARG_LIMIT = 100_000; // 100KB safe threshold
+    const SYS_PROMPT_ARG_LIMIT = 100_000;
     let stdinInput = '';
 
     if (systemPrompt && systemPrompt.length <= SYS_PROMPT_ARG_LIMIT) {
@@ -114,7 +111,6 @@ function callClaude(prompt, systemPrompt, useTools = false) {
       timeout: REQUEST_TIMEOUT,
     });
 
-    // Write prompt via stdin to avoid ARG_MAX limits
     proc.stdin.write(stdinInput);
     proc.stdin.end();
 
@@ -127,26 +123,39 @@ function callClaude(prompt, systemPrompt, useTools = false) {
     proc.on('close', (code) => {
       if (code !== 0) {
         reject(new Error(`Claude CLI exited with code ${code}: ${stderr.slice(0, 500)}`));
-      } else {
-        let result = stdout.trim();
-        // In tools mode, parse the JSON envelope to extract the result text
-        if (useTools && result) {
-          try {
-            const json = JSON.parse(result);
-            result = (json.result || result).trim();
-          } catch (_) {
-            // Not JSON — use raw output as fallback
-          }
-        }
-        resolve(result);
+        return;
       }
+
+      // Parse stream-json: extract text from assistant messages
+      const textParts = [];
+      const lines = stdout.split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          if (event.type === 'assistant' && event.message?.content) {
+            for (const block of event.message.content) {
+              if (block.type === 'text' && block.text) {
+                textParts.push(block.text);
+              }
+            }
+          }
+          // Also check the result field as fallback
+          if (event.type === 'result' && event.result) {
+            textParts.push(event.result);
+          }
+        } catch (_) {
+          // Skip non-JSON lines
+        }
+      }
+
+      const result = textParts.join('').trim();
+      resolve(result);
     });
 
     proc.on('error', (err) => {
       reject(new Error(`Failed to spawn Claude CLI: ${err.message}`));
     });
 
-    // Safety timeout
     setTimeout(() => {
       try { proc.kill('SIGTERM'); } catch (_) {}
       reject(new Error('Claude CLI timed out'));
@@ -200,7 +209,8 @@ app.post('/v1/chat/completions', auth, async (req, res) => {
     // built-in tools (Read, Write, Bash, etc.) via --dangerously-skip-permissions.
     // It executes tools internally and returns the final text result.
     // -----------------------------------------------------------------------
-    const result = await callClaude(prompt, systemPrompt || undefined, hasTools);
+    const requestMaxTurns = req.body.max_turns ?? DEFAULT_MAX_TOOL_TURNS;
+    const result = await callClaude(prompt, systemPrompt || undefined, hasTools, requestMaxTurns);
 
     // -----------------------------------------------------------------------
     // If client requested streaming, simulate SSE from the complete response
