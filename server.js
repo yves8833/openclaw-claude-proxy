@@ -15,6 +15,7 @@ const API_KEY = process.env.API_KEY || '';
 const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude';
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '3', 10);
 const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '240000', 10);
+const MAX_BUDGET_USD = process.env.MAX_BUDGET_USD || '0.05'; // per-call budget cap; prevents extra usage spend
 
 let activeRequests = 0;
 
@@ -86,7 +87,7 @@ function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_M
     // Always use --verbose --output-format stream-json to parse assistant
     // messages directly, because CLI v2.1.83 has a bug where --print returns
     // empty "result" even when the model actually responded.
-    const args = ['--print', '--verbose', '--output-format', 'stream-json'];
+    const args = ['--print', '--verbose', '--output-format', 'stream-json', '--max-budget-usd', MAX_BUDGET_USD];
 
     if (useTools) {
       args.push('--dangerously-skip-permissions');
@@ -121,6 +122,13 @@ function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_M
     proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
     proc.on('close', (code) => {
+      // Detect budget/usage exhaustion from stderr or exit code
+      const lowerStderr = stderr.toLowerCase();
+      if (lowerStderr.includes('budget') || lowerStderr.includes('usage limit') || lowerStderr.includes('rate limit') || lowerStderr.includes('extra usage')) {
+        reject(new Error(`Claude CLI usage/budget exceeded: ${stderr.slice(0, 500)}`));
+        return;
+      }
+
       if (code !== 0) {
         reject(new Error(`Claude CLI exited with code ${code}: ${stderr.slice(0, 500)}`));
         return;
