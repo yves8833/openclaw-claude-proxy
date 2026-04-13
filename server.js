@@ -14,7 +14,7 @@ const PORT = parseInt(process.env.PORT || '3456', 10);
 const API_KEY = process.env.API_KEY || '';
 const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude';
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '3', 10);
-const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '300000', 10);
+const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '240000', 10);
 
 let activeRequests = 0;
 
@@ -314,6 +314,45 @@ app.get('/v1/models', auth, (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', active_requests: activeRequests, max_concurrent: MAX_CONCURRENT });
+});
+
+// ---------------------------------------------------------------------------
+// Readiness check — actually spawns CLI to verify it can respond
+// ---------------------------------------------------------------------------
+let lastReadyCheck = { ok: false, ts: 0, error: '' };
+const READY_CACHE_MS = 60_000; // cache result for 60s
+
+app.get('/health/ready', async (req, res) => {
+  const now = Date.now();
+  if (now - lastReadyCheck.ts < READY_CACHE_MS) {
+    const status = lastReadyCheck.ok ? 200 : 503;
+    return res.status(status).json({
+      status: lastReadyCheck.ok ? 'ready' : 'not_ready',
+      cached: true,
+      error: lastReadyCheck.error || undefined,
+      active_requests: activeRequests,
+    });
+  }
+
+  try {
+    const result = await callClaude('回覆 ok');
+    const ok = result && result.length > 0;
+    lastReadyCheck = { ok, ts: now, error: ok ? '' : 'empty response' };
+    const status = ok ? 200 : 503;
+    res.status(status).json({
+      status: ok ? 'ready' : 'not_ready',
+      cached: false,
+      active_requests: activeRequests,
+    });
+  } catch (err) {
+    lastReadyCheck = { ok: false, ts: now, error: err.message };
+    res.status(503).json({
+      status: 'not_ready',
+      cached: false,
+      error: err.message,
+      active_requests: activeRequests,
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
