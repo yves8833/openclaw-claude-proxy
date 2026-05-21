@@ -15,7 +15,7 @@ const API_KEY = process.env.API_KEY || '';
 const CLAUDE_CLI = process.env.CLAUDE_CLI_PATH || 'claude';
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '3', 10);
 const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '240000', 10);
-const MAX_BUDGET_USD = process.env.MAX_BUDGET_USD || '0.05'; // per-call budget cap; prevents extra usage spend
+const MAX_BUDGET_USD = process.env.MAX_BUDGET_USD || '1.00'; // per-call budget cap; prevents extra usage spend
 
 let activeRequests = 0;
 
@@ -82,12 +82,16 @@ function messagesToPrompt(messages) {
 // ---------------------------------------------------------------------------
 const DEFAULT_MAX_TOOL_TURNS = parseInt(process.env.MAX_TOOL_TURNS || '10', 10);
 
-function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_MAX_TOOL_TURNS) {
+function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_MAX_TOOL_TURNS, model = null, requestedCwd = null) {
   return new Promise((resolve, reject) => {
     // Always use --verbose --output-format stream-json to parse assistant
     // messages directly, because CLI v2.1.83 has a bug where --print returns
     // empty "result" even when the model actually responded.
     const args = ['--print', '--verbose', '--output-format', 'stream-json', '--max-budget-usd', MAX_BUDGET_USD];
+
+    if (model) {
+      args.push('--model', model);
+    }
 
     if (useTools) {
       args.push('--dangerously-skip-permissions');
@@ -105,8 +109,24 @@ function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_M
 
     stdinInput += prompt;
 
+    // Resolve cwd: caller-provided absolute path under HOME, else default to HOME.
+    // Only honor cwd inside HOME to avoid arbitrary filesystem access.
+    const fs = require('fs');
+    const path = require('path');
+    const home = process.env.HOME || '/home/ubuntu';
+    let cwd = home;
+    if (requestedCwd && typeof requestedCwd === 'string') {
+      try {
+        const resolved = path.resolve(requestedCwd);
+        const homeResolved = path.resolve(home);
+        if (resolved.startsWith(homeResolved + path.sep) && fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+          cwd = resolved;
+        }
+      } catch (_) { /* fall through to home */ }
+    }
+
     const proc = spawn(CLAUDE_CLI, args, {
-      cwd: process.env.HOME || '/home/ubuntu',
+      cwd,
       env: { ...process.env },
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: REQUEST_TIMEOUT,
@@ -121,53 +141,85 @@ function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_M
     proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
     proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
-    proc.on('close', (code) => {
-      // Detect budget/usage exhaustion from stderr or exit code
-      const lowerStderr = stderr.toLowerCase();
-      if (lowerStderr.includes('budget') || lowerStderr.includes('usage limit') || lowerStderr.includes('rate limit') || lowerStderr.includes('extra usage')) {
-        reject(new Error(`Claude CLI usage/budget exceeded: ${stderr.slice(0, 500)}`));
-        return;
-      }
-
-      if (code !== 0) {
-        reject(new Error(`Claude CLI exited with code ${code}: ${stderr.slice(0, 500)}`));
-        return;
-      }
-
-      // Parse stream-json: extract text from assistant messages
+    // Always parse stdout stream-json once close fires — CLI writes structured
+    // errors (model_not_found, etc.) into a final {type:"result", is_error:true,
+    // api_error_status:404, result:"..."} event on stdout, not stderr.
+    const parseStreamJson = () => {
       const textParts = [];
-      const lines = stdout.split('\n').filter(Boolean);
-      for (const line of lines) {
+      let resultEvent = null;
+      for (const line of stdout.split('\n').filter(Boolean)) {
         try {
           const event = JSON.parse(line);
           if (event.type === 'assistant' && event.message?.content) {
             for (const block of event.message.content) {
-              if (block.type === 'text' && block.text) {
-                textParts.push(block.text);
-              }
+              if (block.type === 'text' && block.text) textParts.push(block.text);
             }
           }
-          // Also check the result field as fallback
-          if (event.type === 'result' && event.result) {
-            textParts.push(event.result);
-          }
-        } catch (_) {
-          // Skip non-JSON lines
-        }
+          if (event.type === 'result') resultEvent = event;
+        } catch (_) { /* skip non-JSON */ }
+      }
+      return { text: textParts.join('').trim(), resultEvent };
+    };
+
+    const timer = setTimeout(() => {
+      try { proc.kill('SIGTERM'); } catch (_) {}
+      const err = new Error('Claude CLI timed out');
+      err.upstreamStatus = 504;
+      err.upstreamErrorType = 'timeout_error';
+      reject(err);
+    }, REQUEST_TIMEOUT + 5000);
+
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+
+      const lowerStderr = stderr.toLowerCase();
+      if (lowerStderr.includes('budget') || lowerStderr.includes('usage limit') || lowerStderr.includes('rate limit') || lowerStderr.includes('extra usage')) {
+        const err = new Error(`Claude CLI usage/budget exceeded: ${stderr.slice(0, 500)}`);
+        err.upstreamStatus = 429;
+        err.upstreamErrorType = 'rate_limit_error';
+        reject(err);
+        return;
       }
 
-      const result = textParts.join('').trim();
-      resolve(result);
+      const { text, resultEvent } = parseStreamJson();
+
+      // CLI signals errors via stream-json {is_error:true, api_error_status, result}.
+      // Exit code may be 0 (TTY path) or 1 (pipe path) — always check the event.
+      if (resultEvent?.is_error) {
+        const status = resultEvent.api_error_status || 500;
+        const msg = resultEvent.result || `Claude CLI error (exit ${code})`;
+        const err = new Error(msg);
+        err.upstreamStatus = status;
+        err.upstreamErrorType = status === 404 ? 'model_not_found'
+          : status === 401 ? 'authentication_error'
+          : status === 429 ? 'rate_limit_error'
+          : status >= 400 && status < 500 ? 'invalid_request_error'
+          : 'upstream_error';
+        err.upstreamStdoutTail = stdout.slice(-500);
+        reject(err);
+        return;
+      }
+
+      if (code !== 0) {
+        // exit non-zero but no structured error — surface whatever we can
+        const tail = stdout.slice(-500) || stderr.slice(0, 500);
+        const err = new Error(`Claude CLI exited with code ${code}: ${tail}`);
+        err.upstreamStatus = 502;
+        err.upstreamErrorType = 'upstream_error';
+        reject(err);
+        return;
+      }
+
+      resolve(text);
     });
 
     proc.on('error', (err) => {
-      reject(new Error(`Failed to spawn Claude CLI: ${err.message}`));
+      clearTimeout(timer);
+      const e = new Error(`Failed to spawn Claude CLI: ${err.message}`);
+      e.upstreamStatus = 500;
+      e.upstreamErrorType = 'server_error';
+      reject(e);
     });
-
-    setTimeout(() => {
-      try { proc.kill('SIGTERM'); } catch (_) {}
-      reject(new Error('Claude CLI timed out'));
-    }, REQUEST_TIMEOUT + 5000);
   });
 }
 
@@ -175,7 +227,7 @@ function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_M
 // POST /v1/chat/completions
 // ---------------------------------------------------------------------------
 app.post('/v1/chat/completions', auth, async (req, res) => {
-  const { messages, model, stream, max_tokens, tools } = req.body;
+  const { messages, model, stream, max_tokens, tools, cwd } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({
@@ -218,7 +270,7 @@ app.post('/v1/chat/completions', auth, async (req, res) => {
     // It executes tools internally and returns the final text result.
     // -----------------------------------------------------------------------
     const requestMaxTurns = req.body.max_turns ?? DEFAULT_MAX_TOOL_TURNS;
-    const result = await callClaude(prompt, systemPrompt || undefined, hasTools, requestMaxTurns);
+    const result = await callClaude(prompt, systemPrompt || undefined, hasTools, requestMaxTurns, model || null, cwd || null);
 
     // -----------------------------------------------------------------------
     // If client requested streaming, simulate SSE from the complete response
@@ -281,9 +333,14 @@ app.post('/v1/chat/completions', auth, async (req, res) => {
 
   } catch (err) {
     activeRequests--;
-    console.error(`[${new Date().toISOString()}] Error ${requestId}:`, err.message);
-    res.status(500).json({
-      error: { message: err.message, type: 'server_error' }
+    const status = err.upstreamStatus || 500;
+    const type = err.upstreamErrorType || 'server_error';
+    console.error(`[${new Date().toISOString()}] Error ${requestId} [${status} ${type}]:`, err.message);
+    if (err.upstreamStdoutTail) {
+      console.error(`  stdout tail: ${err.upstreamStdoutTail}`);
+    }
+    res.status(status).json({
+      error: { message: err.message, type }
     });
   }
 });
