@@ -439,7 +439,7 @@ app.get('/health', (req, res) => {
 let lastReadyCheck = { ok: false, ts: 0, error: '' };
 const READY_CACHE_MS = 60_000; // cache result for 60s
 
-app.get('/health/ready', async (req, res) => {
+app.get('/health/ready', auth, async (req, res) => {
   const now = Date.now();
   if (now - lastReadyCheck.ts < READY_CACHE_MS) {
     const status = lastReadyCheck.ok ? 200 : 503;
