@@ -117,14 +117,18 @@ const dotenv = require('fs').existsSync('.env')
 module.exports = { apps: [{ name:'openclaw-claude-proxy', script:'server.js', instances:1, autorestart:true, watch:false, max_memory_restart:'256M', env:{ NODE_ENV:'production', ...dotenv }}]};
 EOF
 
-# server.js — 從 fork 的 raw URL 拉最新版（之前內嵌 heredoc 副本嚴重落後主檔，
-# 包括 stream-json 解析、--max-budget-usd、cwd 沙箱、/health/ready、failover 都沒同步）
-SERVER_JS_URL="${SERVER_JS_URL:-https://raw.githubusercontent.com/yves8833/openclaw-claude-proxy/master/server.js}"
-echo -n "  下載 server.js... "
+# server.js — pin 到 immutable commit SHA 而非 mutable `master`。理由：若 fork
+# 帳號被入侵 (token leak / phishing)，攻擊者可悄悄推惡意 server.js 到 master，
+# 所有後來安裝的人立即被 RCE（server.js 會被 launchd 跑且 spawn 帶
+# --dangerously-skip-permissions）。pin SHA 把信任凍結在你決定安裝的那刻。
+# 更新方式：把下方 SERVER_JS_REF 改成新 commit 的 SHA（git log -1 --format=%H -- server.js）
+SERVER_JS_REF="${SERVER_JS_REF:-cb7e905c409817b84ad7b62eaaff9ae8dee1ceb6}"
+SERVER_JS_URL="${SERVER_JS_URL:-https://raw.githubusercontent.com/yves8833/openclaw-claude-proxy/${SERVER_JS_REF}/server.js}"
+echo -n "  下載 server.js (ref=${SERVER_JS_REF:0:7})... "
 if ! curl -fsSL "$SERVER_JS_URL" -o "$PROXY_DIR/server.js"; then
   echo -e "${R}✗${N}"
   echo "  無法下載：$SERVER_JS_URL"
-  echo "  （網路問題或 URL 失效；可用 SERVER_JS_URL=<your-url> bash setup.sh 覆寫）"
+  echo "  （網路問題、SHA 不存在或 URL 失效；可用 SERVER_JS_URL=<your-url> bash setup.sh 覆寫）"
   exit 1
 fi
 echo -e "${G}✓${N}"
