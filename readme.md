@@ -197,6 +197,52 @@ sudo systemctl start openclaw
 | `OPENAI_BASE_URL` 沒用 | 請求打去真 OpenAI | OpenClaw 不讀這個環境變數，必須用 config |
 | Streaming 卡住 | Bot 沒回應也沒報錯 | `--print` 不支援真 streaming，改 simulated stream |
 | Sandbox 擋寫入 | Bot 說不能寫 workspace | 改 CLI 工作目錄到 `$HOME` + 開 `tools.fs.workspaceOnly: false` |
+| Primary 配額打滿 | 所有請求 429，Bot 像當機 | 加第二個 Max 帳號做 fallback（見「多帳號 Failover」） |
+
+---
+
+## 多帳號 Failover（避免配額卡死）
+
+單一 Max 訂閱有 5 小時 reset 的配額窗口。被打滿時，所有經過 Proxy 的請求會 429，整個 Bot 看起來像當機。
+
+如果你願意再付一份 Max 訂閱（或用另一個身分的 Max/Pro 帳號），可以掛第二把鑰匙當 fallback。Proxy 偵測到 primary 回 429 時自動切到 fallback 並**黏住 1 小時**（sticky cooldown），時間過了再試 primary。
+
+**為什麼是 sticky 而不是每筆重試？** Claude Code CLI 冷啟動 + Anthropic API 連線 + 收到 429 大約要 5 秒。如果每筆請求都先探一次 primary，每筆都浪費這 5 秒、又額外打一次已知會失敗的 quota probe。Sticky cooldown 等於「第一筆付 5 秒成本，接下來 1 小時所有請求都省下這 5 秒」。
+
+### 設定步驟
+
+1. 在 server 上建獨立 config 目錄，登入第二個帳號：
+
+   ```bash
+   CLAUDE_CONFIG_DIR=$HOME/.claude-work claude
+   # 瀏覽器登入第二個 Max 帳號，完成後 Ctrl+C
+   ```
+
+2. Proxy env 加一行（PM2 走 `.env`，launchd 走 plist 的 `EnvironmentVariables`）：
+
+   ```bash
+   CLAUDE_CONFIG_DIR_FALLBACK=/home/ubuntu/.claude-work
+   # 可選：cooldown 時長 ms，預設 3600000 = 1 小時
+   # FALLBACK_COOLDOWN_MS=3600000
+   ```
+
+3. 重啟 Proxy。啟動 banner 應顯示 `Fallback: enabled (cooldown 60m)`。
+
+### 你會看到的 log
+
+```
+Request chatcmpl-xxx | model=claude-haiku-4-5 | ...
+[failover] primary rate-limited, switching to fallback until 2026-05-27T11:25:48Z
+Completed chatcmpl-xxx | response_len=22
+```
+
+接下來 1 小時內的請求**不會再出現 `[failover]` 行**，直接 spawn fallback。1 小時後第一筆請求若 primary 已復活，會出現 `[failover] primary recovered, cooldown cleared`。
+
+### 邊界
+
+- **只有 `rate_limit_error` 觸發 fallback**。Token 過期、model not found 等錯誤直接回給 client — 切過去也救不了同一類問題，反而浪費 fallback 配額。
+- **Cooldown 是 process-local**。proxy 重啟（PM2 restart / launchctl reload）會清零，下一筆請求重新探測 primary。
+- **成本**：第二個 Max = 多 $200/月。也可用 Pro 或免費帳號降本，但 fallback 配額相應更小。
 
 ---
 

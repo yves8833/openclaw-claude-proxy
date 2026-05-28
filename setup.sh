@@ -94,6 +94,15 @@ CLAUDE_CLI_PATH=claude
 MAX_CONCURRENT=3
 REQUEST_TIMEOUT=300000
 MAX_TOOL_TURNS=10
+# --- 多帳號 Failover（選用）---------------------------------------------
+# Primary 配額打滿時自動切到第二個 Max/Pro 帳號，sticky 1 小時，省去每筆 5 秒
+# 探測成本。啟用方式：
+#   1) 登入第二個帳號到獨立 config dir：
+#        CLAUDE_CONFIG_DIR=\$HOME/.claude-work claude
+#   2) 取消下行註解、改成你的絕對路徑（\$HOME 不會展開，要寫死）
+#   3) pm2 restart openclaw-claude-proxy
+# CLAUDE_CONFIG_DIR_FALLBACK=${HOME}/.claude-work
+# FALLBACK_COOLDOWN_MS=3600000
 EOF
 
 cat > "$PROXY_DIR/.gitignore" << 'EOF'
@@ -195,6 +204,11 @@ echo -e "${G}  ✅ 安裝完成！打開 Telegram 跟 Bot 說句話。${N}"
 echo -e "${G}════════════════════════════════════════════${N}"
 echo ""
 echo "  Proxy API Key: ${PROXY_API_KEY}"
+echo ""
+echo "  進階：多帳號 Failover（primary 配額滿時自動切到第二個帳號）"
+echo "    1) CLAUDE_CONFIG_DIR=\$HOME/.claude-work claude    # 登入第二個 Max 帳號"
+echo "    2) 編輯 $PROXY_DIR/.env，取消 CLAUDE_CONFIG_DIR_FALLBACK 註解"
+echo "    3) pm2 restart openclaw-claude-proxy"
 echo ""
 echo "  常用指令："
 echo "    pm2 logs openclaw-claude-proxy   # Proxy log"

@@ -17,7 +17,15 @@ const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '3', 10);
 const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || '240000', 10);
 const MAX_BUDGET_USD = process.env.MAX_BUDGET_USD || '1.00'; // per-call budget cap; prevents extra usage spend
 
+// Identity / failover config.
+// PRIMARY = CLI default (~/.claude) when empty; FALLBACK only engages when set.
+// Sticky circuit breaker: primary 429 → switch to fallback for COOLDOWN_MS.
+const PRIMARY_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR_PRIMARY || '';
+const FALLBACK_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR_FALLBACK || '';
+const FALLBACK_COOLDOWN_MS = parseInt(process.env.FALLBACK_COOLDOWN_MS || '3600000', 10);
+
 let activeRequests = 0;
+let primaryCooldownUntil = 0;
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -82,7 +90,48 @@ function messagesToPrompt(messages) {
 // ---------------------------------------------------------------------------
 const DEFAULT_MAX_TOOL_TURNS = parseInt(process.env.MAX_TOOL_TURNS || '10', 10);
 
-function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_MAX_TOOL_TURNS, model = null, requestedCwd = null) {
+function getIdentities() {
+  const ids = [{ name: 'primary', configDir: PRIMARY_CONFIG_DIR }];
+  if (FALLBACK_CONFIG_DIR) ids.push({ name: 'fallback', configDir: FALLBACK_CONFIG_DIR });
+  return ids;
+}
+
+async function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_MAX_TOOL_TURNS, model = null, requestedCwd = null) {
+  const identities = getIdentities();
+  let lastError = null;
+
+  for (let i = 0; i < identities.length; i++) {
+    const identity = identities[i];
+
+    // Skip primary while in cooldown window.
+    if (identity.name === 'primary' && Date.now() < primaryCooldownUntil && identities.length > 1) {
+      continue;
+    }
+
+    try {
+      const result = await spawnClaudeOnce(prompt, systemPrompt, useTools, maxTurns, model, requestedCwd, identity);
+      // Primary recovered after a fallback episode — clear cooldown.
+      if (identity.name === 'primary' && primaryCooldownUntil > 0) {
+        primaryCooldownUntil = 0;
+        console.log(`[${new Date().toISOString()}] [failover] primary recovered, cooldown cleared`);
+      }
+      return result;
+    } catch (err) {
+      lastError = err;
+      const hasFallback = i < identities.length - 1;
+      // Only rate_limit on primary trips the breaker — other errors aren't quota issues.
+      if (err.upstreamErrorType === 'rate_limit_error' && identity.name === 'primary' && hasFallback) {
+        primaryCooldownUntil = Date.now() + FALLBACK_COOLDOWN_MS;
+        console.log(`[${new Date().toISOString()}] [failover] primary rate-limited, switching to fallback until ${new Date(primaryCooldownUntil).toISOString()}`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
+}
+
+function spawnClaudeOnce(prompt, systemPrompt, useTools, maxTurns, model, requestedCwd, identity) {
   return new Promise((resolve, reject) => {
     // Always use --verbose --output-format stream-json to parse assistant
     // messages directly, because CLI v2.1.83 has a bug where --print returns
@@ -125,9 +174,12 @@ function callClaude(prompt, systemPrompt, useTools = false, maxTurns = DEFAULT_M
       } catch (_) { /* fall through to home */ }
     }
 
+    const childEnv = { ...process.env };
+    if (identity.configDir) childEnv.CLAUDE_CONFIG_DIR = identity.configDir;
+
     const proc = spawn(CLAUDE_CLI, args, {
       cwd,
-      env: { ...process.env },
+      env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: REQUEST_TIMEOUT,
     });
@@ -431,6 +483,7 @@ app.listen(PORT, '0.0.0.0', () => {
 ║  Auth: ${API_KEY ? 'Enabled'.padEnd(38) : 'Disabled (set API_KEY)'.padEnd(38)}║
 ║  Max concurrent: ${String(MAX_CONCURRENT).padEnd(27)}║
 ║  CLI: ${CLAUDE_CLI.padEnd(39)}║
+║  Fallback: ${(FALLBACK_CONFIG_DIR ? `enabled (cooldown ${Math.round(FALLBACK_COOLDOWN_MS / 60000)}m)` : 'disabled').padEnd(34)}║
 ╠══════════════════════════════════════════════╣
 ║  POST /v1/chat/completions                   ║
 ║  GET  /v1/models                             ║
