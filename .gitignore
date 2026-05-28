@@ -1,3 +1,4 @@
 node_modules/
 .env
 DEPLOY_NOTES.md
+launchd-*.log
