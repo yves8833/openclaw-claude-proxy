@@ -117,27 +117,17 @@ const dotenv = require('fs').existsSync('.env')
 module.exports = { apps: [{ name:'openclaw-claude-proxy', script:'server.js', instances:1, autorestart:true, watch:false, max_memory_restart:'256M', env:{ NODE_ENV:'production', ...dotenv }}]};
 EOF
 
-# server.js — 核心 Proxy
-cat > "$PROXY_DIR/server.js" << 'SERVEREOF'
-#!/usr/bin/env node
-const express=require('express'),{spawn}=require('child_process'),{randomUUID}=require('crypto');
-const PORT=parseInt(process.env.PORT||'3456',10),API_KEY=process.env.API_KEY||'',CLI=process.env.CLAUDE_CLI_PATH||'claude';
-const MAX_C=parseInt(process.env.MAX_CONCURRENT||'3',10),TIMEOUT=parseInt(process.env.REQUEST_TIMEOUT||'300000',10);
-const MAX_TURNS=parseInt(process.env.MAX_TOOL_TURNS||'10',10);
-let active=0;const app=express();app.use(express.json({limit:'10mb'}));
-
-function auth(req,res,next){if(!API_KEY)return next();const h=req.headers.authorization||'';const t=h.startsWith('Bearer ')?h.slice(7):h;if(t!==API_KEY)return res.status(401).json({error:{message:'Invalid API key',type:'auth_error'}});next();}
-
-function msgs2prompt(msgs){if(!Array.isArray(msgs)||!msgs.length)return'';const p=[];for(const m of msgs){const r=m.role||'user';const c=typeof m.content==='string'?m.content:Array.isArray(m.content)?m.content.map(x=>x.text||'').join('\n'):String(m.content||'');if(r==='system')p.push(`[System Instructions]\n${c}\n[End System Instructions]`);else if(r==='assistant'){if(m.tool_calls&&Array.isArray(m.tool_calls)){const td=m.tool_calls.map(tc=>{let a=tc.function?.arguments||'{}';try{a=JSON.stringify(JSON.parse(a),null,2)}catch(_){}return`[Tool Call: ${tc.function?.name}]\n${a}`}).join('\n');p.push(`[Previous Assistant Response]\n${c||''}${td?'\n'+td:''}`);}else p.push(`[Previous Assistant Response]\n${c}`);}else if(r==='tool')p.push(`[Tool Result: ${m.name||m.tool_call_id||'?'}]\n${c}`);else p.push(c);}return p.join('\n\n');}
-
-function callClaude(prompt,sys,tools){return new Promise((resolve,reject)=>{const args=['--print'];if(tools){args.push('--dangerously-skip-permissions','--max-turns',String(MAX_TURNS),'--output-format','json');}let stdin='';if(sys&&sys.length<=100000)args.push('--system-prompt',sys);else if(sys)stdin+=`[System Instructions]\n${sys}\n[End System Instructions]\n\n`;stdin+=prompt;const proc=spawn(CLI,args,{cwd:process.env.HOME||'/home/ubuntu',env:{...process.env},stdio:['pipe','pipe','pipe'],timeout:TIMEOUT});proc.stdin.write(stdin);proc.stdin.end();let out='',err='';proc.stdout.on('data',c=>{out+=c.toString()});proc.stderr.on('data',c=>{err+=c.toString()});proc.on('close',code=>{if(code!==0)return reject(new Error(`CLI exit ${code}: ${err.slice(0,500)}`));let r=out.trim();if(tools&&r){try{r=(JSON.parse(r).result||r).trim()}catch(_){}}resolve(r)});proc.on('error',e=>reject(new Error(`Spawn: ${e.message}`)));setTimeout(()=>{try{proc.kill('SIGTERM')}catch(_){}reject(new Error('Timeout'))},TIMEOUT+5000)});}
-
-app.post('/v1/chat/completions',auth,async(req,res)=>{const{messages,model,stream,tools}=req.body;if(!messages||!Array.isArray(messages))return res.status(400).json({error:{message:'messages required'}});if(active>=MAX_C)return res.status(429).json({error:{message:'Too many requests'}});active++;const id=`chatcmpl-${randomUUID().replace(/-/g,'').slice(0,24)}`,ts=Math.floor(Date.now()/1000);let sys='';const nm=[];for(const m of messages){if(m.role==='system')sys+=(sys?'\n':'')+(typeof m.content==='string'?m.content:'');else nm.push(m);}const ht=tools&&Array.isArray(tools)&&tools.length>0;const prompt=msgs2prompt(nm);console.log(`[${new Date().toISOString()}] ${id} | stream=${!!stream} | tools=${ht} | msgs=${messages.length}`);try{const result=await callClaude(prompt,sys||undefined,ht);if(stream){res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-cache');res.setHeader('Connection','keep-alive');res.write(`data: ${JSON.stringify({id,object:'chat.completion.chunk',created:ts,model:model||'claude-opus-4-6',choices:[{index:0,delta:{role:'assistant',content:result},finish_reason:null}]})}\n\n`);res.write(`data: ${JSON.stringify({id,object:'chat.completion.chunk',created:ts,model:model||'claude-opus-4-6',choices:[{index:0,delta:{},finish_reason:'stop'}]})}\n\n`);res.write('data: [DONE]\n\n');res.end();}else{res.json({id,object:'chat.completion',created:ts,model:model||'claude-opus-4-6',choices:[{index:0,message:{role:'assistant',content:result},finish_reason:'stop'}],usage:{prompt_tokens:Math.ceil(prompt.length/4),completion_tokens:Math.ceil(result.length/4),total_tokens:Math.ceil((prompt.length+result.length)/4)}});}active--;console.log(`[${new Date().toISOString()}] Done ${id} | len=${result.length}`);}catch(e){active--;console.error(`[${new Date().toISOString()}] Err ${id}: ${e.message}`);res.status(500).json({error:{message:e.message}});}});
-
-app.get('/v1/models',auth,(_,res)=>res.json({object:'list',data:[{id:'claude-opus-4-6',object:'model',created:1700000000,owned_by:'anthropic'},{id:'claude-sonnet-4-5-20250929',object:'model',created:1700000000,owned_by:'anthropic'}]}));
-app.get('/health',(_,res)=>res.json({status:'ok',active_requests:active,max_concurrent:MAX_C}));
-app.listen(PORT,'0.0.0.0',()=>console.log(`Proxy :${PORT} | Auth:${API_KEY?'ON':'OFF'} | Max:${MAX_C}`));
-SERVEREOF
+# server.js — 從 fork 的 raw URL 拉最新版（之前內嵌 heredoc 副本嚴重落後主檔，
+# 包括 stream-json 解析、--max-budget-usd、cwd 沙箱、/health/ready、failover 都沒同步）
+SERVER_JS_URL="${SERVER_JS_URL:-https://raw.githubusercontent.com/yves8833/openclaw-claude-proxy/master/server.js}"
+echo -n "  下載 server.js... "
+if ! curl -fsSL "$SERVER_JS_URL" -o "$PROXY_DIR/server.js"; then
+  echo -e "${R}✗${N}"
+  echo "  無法下載：$SERVER_JS_URL"
+  echo "  （網路問題或 URL 失效；可用 SERVER_JS_URL=<your-url> bash setup.sh 覆寫）"
+  exit 1
+fi
+echo -e "${G}✓${N}"
 
 cd "$PROXY_DIR" && npm install --production > /dev/null 2>&1
 cd "$PROXY_DIR" && pm2 delete openclaw-claude-proxy 2>/dev/null || true
